@@ -1,0 +1,250 @@
+name: Stale-branch sweep
+description: |
+  Enumerate refs/heads/* on the current repo, classify each non-default
+  branch by age + PR state, and upsert a single tracking issue
+  summarising the result.
+
+  Categories (default thresholds):
+    • fresh (<48h)            — not reported
+    • stale (48h – 7d, no merged PR)  — listed as "stale"
+    • abandoned (>7d, no merged PR)   — listed as "propose deletion"
+    • merged-but-not-deleted (PR merged, branch still present) — listed as "delete me"
+
+  Designed to be invoked from a nightly `stale-sweep.yml` workflow in
+  each consumer repo. The cross-repo aggregator (P5.2) consumes the
+  per-repo issue body via the GitHub API. See P5.1 in
+  ai-fundamentals/dev-workflow-analysis-2026-05-10.md §5.8 H1.
+
+inputs:
+  gh-token:
+    description: "Token with `contents: read`, `issues: write`, `pull-requests: read` on the calling repo. Default: GITHUB_TOKEN."
+    required: false
+    default: ${{ github.token }}
+  warn-days:
+    description: "Branch age in days at which a branch becomes 'stale'."
+    required: false
+    default: "2"
+  delete-days:
+    description: "Branch age in days at which a branch becomes 'propose deletion'."
+    required: false
+    default: "7"
+  issue-label:
+    description: "Label applied to the rolling tracking issue. The label is created if missing."
+    required: false
+    default: "stale-branches"
+  default-branch:
+    description: "Default branch name, never reported. Default: repo's configured default branch."
+    required: false
+    default: ""
+  protected-branches:
+    description: "Comma-separated list of additional branches to skip (e.g. 'release/*,gh-pages'). Glob via shell case-match."
+    required: false
+    default: "gh-pages,release/*"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve default branch
+      id: defaults
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        DEFAULT_IN: ${{ inputs.default-branch }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        if [ -n "${DEFAULT_IN}" ]; then
+          echo "default-branch=${DEFAULT_IN}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        d=$(gh api "/repos/${REPO}" --jq .default_branch)
+        echo "default-branch=${d}" >> "$GITHUB_OUTPUT"
+
+    - name: Ensure issue label exists
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        REPO: ${{ github.repository }}
+        LABEL: ${{ inputs.issue-label }}
+      run: |
+        set -euo pipefail
+        if ! gh api "/repos/${REPO}/labels/${LABEL}" >/dev/null 2>&1; then
+          gh api -X POST "/repos/${REPO}/labels" \
+            -f name="${LABEL}" \
+            -f color="fbca04" \
+            -f description="Tracking issue for the nightly stale-branch sweep." >/dev/null
+        fi
+
+    - name: Enumerate + classify branches
+      id: classify
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        REPO: ${{ github.repository }}
+        DEFAULT_BRANCH: ${{ steps.defaults.outputs.default-branch }}
+        WARN_DAYS: ${{ inputs.warn-days }}
+        DELETE_DAYS: ${{ inputs.delete-days }}
+        PROTECTED_BRANCHES: ${{ inputs.protected-branches }}
+      run: |
+        set -euo pipefail
+
+        now_ts=$(date -u +%s)
+        warn_secs=$(( WARN_DAYS * 86400 ))
+        delete_secs=$(( DELETE_DAYS * 86400 ))
+
+        # protected → array of glob patterns
+        IFS=',' read -ra PROTECTED_PATTERNS <<< "${PROTECTED_BRANCHES}"
+
+        is_protected() {
+          local name="$1"
+          [ "$name" = "$DEFAULT_BRANCH" ] && return 0
+          for p in "${PROTECTED_PATTERNS[@]}"; do
+            p_trimmed="$(echo -n "$p" | tr -d ' ')"
+            [ -z "$p_trimmed" ] && continue
+            case "$name" in
+              $p_trimmed) return 0 ;;
+            esac
+          done
+          return 1
+        }
+
+        # Page through all branches.
+        gh api --paginate "/repos/${REPO}/branches?per_page=100" \
+          --jq '.[] | {name: .name, sha: .commit.sha}' > branches.ndjson
+
+        stale_md=""
+        delete_md=""
+        merged_md=""
+        total=0
+        skipped=0
+
+        while IFS= read -r line; do
+          name=$(echo "$line" | jq -r .name)
+          sha=$(echo "$line" | jq -r .sha)
+          total=$((total + 1))
+
+          if is_protected "$name"; then
+            skipped=$((skipped + 1))
+            continue
+          fi
+
+          # One commit lookup gets both date + author + message (saves an API call).
+          commit_json=$(gh api "/repos/${REPO}/commits/${sha}")
+          commit_date=$(echo "$commit_json" | jq -r .commit.committer.date)
+          commit_ts=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$commit_date" +%s 2>/dev/null \
+            || date -u -d "$commit_date" +%s)
+          age=$(( now_ts - commit_ts ))
+          age_days=$(( age / 86400 ))
+
+          # PR lookup: head branches encode as `owner:branch` upstream.
+          pr_json=$(gh api "/repos/${REPO}/pulls?head=$(echo "${REPO%%/*}"):${name}&state=all&per_page=1" \
+            --jq '.[0] // empty' || echo "")
+
+          pr_state=""
+          pr_num=""
+          pr_merged_at=""
+          if [ -n "$pr_json" ]; then
+            pr_state=$(echo "$pr_json" | jq -r .state)
+            pr_num=$(echo "$pr_json" | jq -r .number)
+            pr_merged_at=$(echo "$pr_json" | jq -r '.merged_at // empty')
+          fi
+
+          # P5.3 attribution: parse `Agent-Id:` commit trailer (last line of
+          # the message body matching `^Agent-Id:\s*<id>`) for branches
+          # created by autonomous agents. Empty when commits are authored
+          # by humans without the trailer.
+          msg=$(echo "$commit_json" | jq -r .commit.message)
+          agent_id=$(echo "$msg" | awk -F': *' '/^Agent-Id:/ {print $2; exit}' | tr -d '\r')
+          [ -z "$agent_id" ] && agent_id="—"
+
+          # Build row
+          author_email=$(echo "$commit_json" | jq -r .commit.author.email)
+          last_commit_url="https://github.com/${REPO}/commit/${sha}"
+          short_sha=${sha:0:7}
+          pr_link="—"
+          [ -n "$pr_num" ] && pr_link="[#${pr_num}](https://github.com/${REPO}/pull/${pr_num}) (${pr_state})"
+
+          row="| \`${name}\` | ${age_days}d | ${agent_id} | ${author_email} | [${short_sha}](${last_commit_url}) | ${pr_link} |"
+
+          if [ -n "$pr_merged_at" ]; then
+            merged_md+="${row}"$'\n'
+            continue
+          fi
+
+          if [ "$age" -gt "$delete_secs" ]; then
+            delete_md+="${row}"$'\n'
+          elif [ "$age" -gt "$warn_secs" ]; then
+            stale_md+="${row}"$'\n'
+          fi
+        done < branches.ndjson
+
+        {
+          echo "total=${total}"
+          echo "skipped=${skipped}"
+        } >> "$GITHUB_OUTPUT"
+
+        # Stash markdown body to a file (multi-line outputs need delimiter dance).
+        today=$(date -u +%Y-%m-%d)
+        {
+          echo "# Stale branch sweep — ${today}"
+          echo
+          echo "_Generated by \`.github/workflows/stale-sweep.yml\` on ${REPO}._"
+          echo
+          echo "Scanned **${total}** branches; **${skipped}** skipped (default + protected). Thresholds: warn=${WARN_DAYS}d, delete=${DELETE_DAYS}d."
+          echo
+
+          if [ -n "$merged_md" ]; then
+            echo "## Merged but still present — delete the local + remote branch"
+            echo
+            echo "| Branch | Age | Agent | Last author | Last commit | PR |"
+            echo "|---|---|---|---|---|---|"
+            printf "%s" "$merged_md"
+            echo
+          fi
+
+          if [ -n "$delete_md" ]; then
+            echo "## Unmerged, >${DELETE_DAYS} days old — propose deletion"
+            echo
+            echo "| Branch | Age | Agent | Last author | Last commit | PR |"
+            echo "|---|---|---|---|---|---|"
+            printf "%s" "$delete_md"
+            echo
+          fi
+
+          if [ -n "$stale_md" ]; then
+            echo "## Unmerged, ${WARN_DAYS}–${DELETE_DAYS} days old — stale, please rebase or close"
+            echo
+            echo "| Branch | Age | Agent | Last author | Last commit | PR |"
+            echo "|---|---|---|---|---|---|"
+            printf "%s" "$stale_md"
+            echo
+          fi
+
+          if [ -z "$merged_md" ] && [ -z "$delete_md" ] && [ -z "$stale_md" ]; then
+            echo "## All branches fresh ✓"
+            echo
+            echo "Nothing aged past the warn threshold. Issue body intentionally kept for the aggregator."
+          fi
+        } > issue-body.md
+
+    - name: Upsert tracking issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        REPO: ${{ github.repository }}
+        LABEL: ${{ inputs.issue-label }}
+      run: |
+        set -euo pipefail
+
+        title="Stale branch sweep"
+
+        existing=$(gh api "/repos/${REPO}/issues?labels=${LABEL}&state=open&per_page=1" --jq '.[0].number // empty')
+
+        body=$(cat issue-body.md)
+
+        if [ -n "$existing" ]; then
+          gh issue edit "$existing" --repo "${REPO}" --body "$body"
+          echo "Updated issue #${existing}"
+        else
+          gh issue create --repo "${REPO}" --title "$title" --body "$body" --label "${LABEL}"
+        fi
