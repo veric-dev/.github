@@ -177,6 +177,41 @@ jobs:
           echo "workspace.package.version is now:"
           awk '/^\[workspace\.package\]/{f=1;next} f && /^version *=/ {print; exit}' Cargo.toml
 
+          # Independently-versioned publishable crates carry their own
+          # `version = "X.Y.Z"` literal in `[package]` (instead of
+          # `version.workspace = true`). The workspace-level awk above
+          # only touches `[workspace.package]`, so those crates keep
+          # their base version and `cargo publish -p <name>` would
+          # collide on Kellnr (409, swallowed) — consumers pinning
+          # `=${PRERELEASE}` for those crates would never find them.
+          #
+          # Walk every publishable crate manifest (via cargo metadata)
+          # and rewrite its `[package].version` literal. The regex
+          # `^version *= *"` matches only literal lines; it does not
+          # touch `version.workspace = true` (note the leading dot).
+          mapfile -t manifests < <(cargo metadata --format-version 1 --no-deps \
+            | jq -r '
+                .packages[]
+                | select((.publish // null) == null or (.publish | length) > 0)
+                | .manifest_path')
+          for manifest in "${manifests[@]}"; do
+            awk -v pre="$PRERELEASE" '
+              BEGIN { in_pkg=0; bumped=0 }
+              /^\[package\]/  { in_pkg=1; print; next }
+              /^\[/            { in_pkg=0; print; next }
+              in_pkg && /^version *= *"[^"]+"/ {
+                sub(/"[^"]+"/, "\"" pre "\"")
+                bumped=1
+                print; next
+              }
+              { print }
+              END {
+                if (bumped) print FILENAME ": [package].version → " pre > "/dev/stderr"
+              }
+            ' "$manifest" > "$manifest.new"
+            mv "$manifest.new" "$manifest"
+          done
+
       - name: Cargo registry auth (publish token)
         uses: veric-dev/.github/actions/cargo-registry-auth@main
         with:
