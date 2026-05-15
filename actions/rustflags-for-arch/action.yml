@@ -1,0 +1,49 @@
+name: Configure RUSTFLAGS for runner arch
+description: |
+  Sets RUSTFLAGS in $GITHUB_ENV for the current runner arch, replacing
+  the inline 8-line shell block that used to live in every Rust workflow
+  in the fleet (audit 2026-05-14: 8 byte-identical sites across ai-fund
+  + veric-engine).
+
+  Why: `-C linker-features=-lld` is load-bearing on x86_64 (Rust 1.82+
+  ships self-contained rust-lld which collides with our preferred mold)
+  but unstable on aarch64. So the flag must branch on arch.
+
+  Must run BEFORE setup-rust (which invokes cargo via rust-cache).
+
+  Pair with the `setup-sccache` + `setup-rust` composites in this org
+  repo for a complete Rust prelude.
+
+inputs:
+  extra-flags:
+    description: |
+      Extra flags prepended to the arch-specific base (e.g. "-Dwarnings"
+      for CI lint enforcement). Default empty.
+    required: false
+    default: ""
+  release-ship:
+    description: |
+      When "true", emit RUSTFLAGS=`<extra-flags>` only — no mold linker
+      override. Used by release-ship builds where LTO dominates link
+      time and mold isn't on the critical path. Default "false".
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Configure RUSTFLAGS for runner arch
+      shell: bash
+      run: |
+        set -euo pipefail
+        EXTRA="${{ inputs.extra-flags }}"
+        SHIP="${{ inputs.release-ship }}"
+        if [ "$SHIP" = "true" ]; then
+          # release-ship: skip mold (LTO dominates), keep extra flags
+          # like -Dwarnings.
+          echo "RUSTFLAGS=${EXTRA}" >> "$GITHUB_ENV"
+        elif [ "$(uname -m)" = "x86_64" ]; then
+          echo "RUSTFLAGS=${EXTRA} -C link-arg=-fuse-ld=mold -C linker-features=-lld" >> "$GITHUB_ENV"
+        else
+          echo "RUSTFLAGS=${EXTRA} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+        fi
