@@ -1,0 +1,21 @@
+name: Show sccache stats
+description: >
+  Emits sccache hit/miss/byte stats at end of a job. Pair with the
+  setup-sccache composite — call this after the last cargo step in
+  any sccache-wired job. Always runs (even on prior step failure)
+  so a failed build still surfaces whether cache lookup was working.
+
+  Why a composite for one line: every consumer repo of the shared
+  Azure sccache backend ends up wanting the same end-of-job stats
+  step, and putting it in a composite means future stats-format
+  changes (`--show-adv-stats`, JSON output, etc.) land in one place.
+
+runs:
+  using: composite
+  steps:
+    - name: sccache --show-stats
+      shell: bash
+      # `|| true` — stats failure (e.g. sccache wasn't installed
+      # because setup-sccache early-failed) shouldn't mask the actual
+      # job result. Read the log; don't break the build.
+      run: sccache --show-stats || true

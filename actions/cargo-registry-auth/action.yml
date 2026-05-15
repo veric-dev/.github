@@ -1,0 +1,126 @@
+name: Cargo registry auth (veric)
+description: >
+  Exchange GitHub OIDC for an AWS access token, pull the kellnr cargo
+  read token from foundation Secrets Manager, and export it + the
+  credential-provider opt-in into $GITHUB_ENV so subsequent cargo steps
+  in the same job transparently resolve crates from
+  registry.veric.dev (and the 4 audience aliases).
+
+  P11d (Azure→AWS cutover, 2026-04-30): replaces the prior
+  Azure OIDC + Key Vault implementation. Inputs `client-id` /
+  `tenant-id` / `subscription-id` / `key-vault-name` are gone. Sibling
+  repos that still pass them surface "Unexpected input(s)" warnings —
+  those warnings are the signal that the calling workflow needs
+  updating.
+
+  Note: the self-hosted Linux runner image (veric-mock VMSS) does not
+  ship `aws` CLI, so we use the JS-based
+  `aws-actions/aws-secretsmanager-get-secrets@v2` action to fetch
+  secrets rather than calling `aws secretsmanager get-secret-value`
+  directly. It runs on Node, so no host tooling is required beyond
+  what every actions/checkout already needs.
+
+inputs:
+  aws-role-arn:
+    description: >
+      Foundation IAM role to assume (veric-cargo-ci-reader). The role's
+      trust policy whitelists the consumer-repo set; ARN is in the SSM
+      parameter /veric/foundation/iam/cargo-ci-reader-role-arn or the
+      org-level Actions variable CARGO_CI_READER_ROLE_ARN.
+    required: true
+  aws-region:
+    description: AWS region for the SM API call.
+    required: false
+    default: us-west-2
+  secret-name:
+    description: >
+      Secrets Manager secret name holding the kellnr token. Default is
+      the read-token used by CI build jobs; pass
+      `veric/foundation/kellnr/cargo-publish-token-veric-ci` from
+      release.yml jobs.
+    required: false
+    default: veric/foundation/kellnr/cargo-read-token-veric-ci
+  fetch-ag-tower-pat:
+    description: >
+      When "true", also fetch `veric/foundation/github-app/ag-tower-release-pat`
+      from SM and export it as AG_TOWER_PAT + GH_TOKEN so veric/build.rs
+      can download the sv-compiler tarball from the private
+      veric-dev/ag-tower repo's GitHub Releases. Default "true" because
+      almost every Rust workflow in this repo transitively builds veric
+      and hits that download path; set "false" only for jobs that
+      genuinely don't invoke veric's build.rs (e.g. a doc-only lint).
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume:    ${{ inputs.aws-role-arn }}
+        aws-region:        ${{ inputs.aws-region }}
+        role-session-name: cargo-registry-auth-${{ github.run_id }}
+
+    # `aws-secretsmanager-get-secrets` is a JS action, so it works on
+    # runner images that don't have `aws` CLI installed. It exports
+    # each requested secret as an env var via core.exportVariable
+    # (which lands in $GITHUB_ENV). The "ALIAS,secret-id" syntax sets
+    # the env var name explicitly; we want stable names regardless of
+    # whether the secret-id ends in -veric-ci or something else.
+    - name: Fetch cargo token from SM
+      uses: aws-actions/aws-secretsmanager-get-secrets@v2
+      with:
+        parse-json-secrets: false
+        secret-ids: |
+          _CARGO_TOKEN,${{ inputs.secret-name }}
+
+    - name: Fetch ag-tower release PAT from SM
+      if: inputs.fetch-ag-tower-pat == 'true'
+      uses: aws-actions/aws-secretsmanager-get-secrets@v2
+      with:
+        parse-json-secrets: false
+        secret-ids: |
+          _AG_TOWER_PAT,veric/foundation/github-app/ag-tower-release-pat
+
+    - name: Wire cargo registry env vars
+      shell: bash
+      env:
+        CARGO_TOKEN_RAW: ${{ env._CARGO_TOKEN }}
+      run: |
+        set -euo pipefail
+        # kellnr stores some tokens with a "Bearer " prefix; cargo wants raw.
+        token="${CARGO_TOKEN_RAW#Bearer }"
+        echo "::add-mask::${token}"
+        # Both registry aliases (veric-exported / veric-internal)
+        # resolve to the same kellnr backend, and one kellnr token
+        # authenticates the user across both. Fan out the same token to
+        # every alias env var so any `cargo publish --registry <alias>`
+        # or `cargo` read of any alias-scoped path-dep finds its
+        # credential. (The legacy AG_EXPORTED / AG_INTERNAL env vars
+        # were retired in Phase 0, 2026-05-08, when the engine swapped
+        # `veric-ag-types` → `veric-ag-types-shim`.)
+        for alias in VERIC_EXPORTED VERIC_INTERNAL; do
+          echo "CARGO_REGISTRIES_${alias}_TOKEN=${token}" >> "$GITHUB_ENV"
+        done
+        # cargo 1.85+ refuses env-var tokens on authenticated registries
+        # without this opt-in.
+        echo "CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token" >> "$GITHUB_ENV"
+
+    - name: Wire ag-tower PAT env vars
+      if: inputs.fetch-ag-tower-pat == 'true'
+      shell: bash
+      env:
+        AG_TOWER_PAT_RAW: ${{ env._AG_TOWER_PAT }}
+      run: |
+        set -euo pipefail
+        pat="${AG_TOWER_PAT_RAW}"
+        echo "::add-mask::${pat}"
+        # Exported as both AG_TOWER_PAT (what veric/build.rs's curl
+        # fallback reads) and GH_TOKEN (what `gh release download` /
+        # the primary build.rs path uses). Forwarding both avoids the
+        # "set the GH_TOKEN environment variable" warning and matches
+        # the long-standing convention from the prior secret-based
+        # wiring.
+        echo "AG_TOWER_PAT=${pat}" >> "$GITHUB_ENV"
+        echo "GH_TOKEN=${pat}"     >> "$GITHUB_ENV"

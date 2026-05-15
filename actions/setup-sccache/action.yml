@@ -1,0 +1,115 @@
+name: Setup sccache (AWS S3 backend, OIDC)
+description: >
+  Wires sccache to the foundation S3 bucket via OIDC. Composes with
+  Swatinem/rust-cache: rust-cache holds the registry + per-crate dirs;
+  sccache holds per-rustc objects. Replaces the prior Azure Blob
+  backend which was destroyed 2026-05-02 with the rest of the Azure
+  decom (the single-shared-account `vericprodagintregsa` storage
+  account is gone).
+
+  Callers pass the org-level vars `SCCACHE_ROLE_ARN` and
+  `SCCACHE_BUCKET` as inputs. Composite action `if:` expressions
+  cannot read `vars.*` directly (only the workflow runtime resolves
+  that context); inputs are the supported way to thread them through.
+  If either input is empty (e.g. during a Tofu apply window before
+  the foundation module landed) every step here no-ops and the job
+  falls back to rust-cache only.
+
+  Preconditions:
+    - The job declares `permissions: id-token: write`.
+    - The repo is in the foundation OIDC trust policy (added in
+      veric-aws/infra/tofu/modules/foundation/sccache/main.tf).
+
+inputs:
+  role-arn:
+    description: >
+      IAM role ARN for the sccache S3 backend. Pass the
+      vars.SCCACHE_ROLE_ARN org var from the caller workflow.
+      Empty disables sccache (rust-cache only).
+    required: false
+    default: ""
+  bucket:
+    description: >
+      S3 bucket name. Pass vars.SCCACHE_BUCKET from the caller.
+      Empty disables sccache.
+    required: false
+    default: ""
+  region:
+    description: AWS region for the bucket. Default `us-west-2` (foundation env region).
+    required: false
+    default: "us-west-2"
+  key-prefix:
+    description: >
+      Optional prefix inside `SCCACHE_S3_KEY_PREFIX`. Use to shard
+      hits/misses by toolchain (e.g. v1-msrv-1.85) — sccache hashes
+      rustc version into the cache key but the prefix gives a clean
+      blast-radius boundary on top.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS for sccache
+      if: inputs.role-arn != '' && inputs.bucket != ''
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.region }}
+
+    - if: inputs.role-arn != '' && inputs.bucket != ''
+      uses: mozilla-actions/sccache-action@v0.0.10
+
+    - name: Wire sccache env
+      if: inputs.role-arn != '' && inputs.bucket != ''
+      shell: bash
+      env:
+        BUCKET: ${{ inputs.bucket }}
+        REGION: ${{ inputs.region }}
+        KEY_PREFIX_INPUT: ${{ inputs.key-prefix }}
+      run: |
+        set -euo pipefail
+        # Per-cache-key prefix isolates miss/hit telemetry across
+        # workflows. github.repository == "veric-dev/ag-tower"; the
+        # caller-supplied key-prefix layers under that for toolchain
+        # sharding (see msrv.yml's `v1-msrv-1.85/...`).
+        prefix="${{ github.repository }}"
+        if [ -n "${KEY_PREFIX_INPUT}" ]; then
+          prefix="${prefix}/${KEY_PREFIX_INPUT}"
+        fi
+        {
+          echo "RUSTC_WRAPPER=sccache"
+          echo "SCCACHE_BUCKET=${BUCKET}"
+          echo "SCCACHE_REGION=${REGION}"
+          echo "SCCACHE_S3_USE_SSL=true"
+          echo "SCCACHE_S3_KEY_PREFIX=${prefix}"
+          # Q1 (audit 2026-05-14): incremental compilation logs
+          # `Non-cacheable: incremental` and bypasses sccache. Set
+          # explicitly here so every workflow that wires sccache also
+          # gets the incremental flag flipped — single source of truth.
+          echo "CARGO_INCREMENTAL=0"
+        } >> "$GITHUB_ENV"
+
+    # Stash the sccache STS credentials under SCCACHE_S3_* names so
+    # downstream steps which run configure-aws-credentials again
+    # (e.g. cargo-registry-auth in release-plz.yml) can clobber AWS_*
+    # without losing the sccache creds. The restore step in
+    # release-plz.yml reads these back into AWS_* before cargo build.
+    # Mirrors veric-ag/.github/actions/setup-sccache/action.yml.
+    - name: Stash sccache STS creds for later restore
+      if: inputs.role-arn != '' && inputs.bucket != ''
+      shell: bash
+      env:
+        AKID: ${{ env.AWS_ACCESS_KEY_ID }}
+        SECRET: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        SESSION: ${{ env.AWS_SESSION_TOKEN }}
+      run: |
+        set -euo pipefail
+        {
+          echo "SCCACHE_S3_ACCESS_KEY=${AKID}"
+          echo "SCCACHE_S3_SECRET_KEY=${SECRET}"
+          echo "SCCACHE_S3_SESSION_TOKEN=${SESSION}"
+        } >> "$GITHUB_ENV"
+        echo "::add-mask::${AKID}"
+        echo "::add-mask::${SECRET}"
+        echo "::add-mask::${SESSION}"

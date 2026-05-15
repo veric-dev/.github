@@ -1,0 +1,127 @@
+name: Setup Rust for veric-engine
+description: |
+  Shared Rust prelude for every workflow that builds the engine
+  workspace: optional private-registry auth, toolchain install,
+  Swatinem/rust-cache with cache-on-failure, optional nextest.
+
+  Callers MUST run actions/checkout@v4 themselves before invoking this
+  composite — GitHub Actions can't load a local composite until the repo
+  is on disk. Matching pattern: `- uses: actions/checkout@v4 with: path:
+  veric-engine` then `- uses: ./veric-engine/.github/actions/setup-rust`.
+
+  sccache wiring is no longer this composite's responsibility — call
+  `./veric-engine/.github/actions/setup-sccache` BEFORE this action in
+  the workflow (so RUSTC_WRAPPER=sccache is set when rust-cache below
+  first invokes cargo) and pair with `sccache-stats` as the last
+  `if: always()` step. Mirrors veric-ag PR #11 / ag-tower's pattern;
+  single source of truth across repos.
+
+  The pre-registry version of this action checked out ag-tower as a
+  sibling; that's dead since the workspace's Cargo.toml pins
+  `ai-veric-analyses = { registry = "veric-internal" }` and the
+  analyser / grammar deps to `veric-internal` / `veric-exported`
+  aliases — all resolved via the kellnr private registry. Registry
+  auth is handled via the nested cargo-registry-auth composite (OIDC
+  → AWS Secrets Manager) when `aws-role-arn` is supplied. (Phase 0,
+  2026-05-08: the legacy `ag-exported` / `ag-internal` aliases were
+  retired alongside the `veric-ag-types` → `veric-ag-types-shim` swap;
+  P13.5, 2026-05-09: the shim was renamed `ai-veric-analyses`.)
+
+inputs:
+  components:
+    description: Extra rustup components (comma-separated).
+    required: false
+    default: ""
+  targets:
+    description: Extra rust target triples (comma-separated).
+    required: false
+    default: ""
+  shared-cache-key:
+    description: Swatinem/rust-cache shared-key. Use the same value across jobs that should share a cache (e.g. rust-ci's 4 jobs).
+    required: false
+    default: ""
+  cache-key:
+    description: Swatinem/rust-cache non-shared key. Mutually exclusive with shared-cache-key; use for matrix builds keyed by target.
+    required: false
+    default: ""
+  save-cache:
+    description: Whether this job writes to the cache ("true"/"false"). Set "false" on jobs that only read a shared cache populated by an upstream job.
+    required: false
+    default: "true"
+  install-nextest:
+    description: Install cargo-nextest via taiki-e/install-action.
+    required: false
+    default: "false"
+  registry-auth:
+    description: Whether to run cargo-registry-auth (OIDC → AWS Secrets Manager → CARGO_REGISTRIES_*_TOKEN). Required for any job that cargo-resolves ag-tower or any private kellnr crate.
+    required: false
+    default: "true"
+  aws-role-arn:
+    description: Foundation IAM role to assume for Secrets Manager pull. Forwarded to cargo-registry-auth.
+    required: false
+    default: ""
+  cargo-secret-name:
+    description: Override SM secret name (default = read token). Set to `veric/foundation/kellnr/cargo-publish-token-veric-ci` for publish flows.
+    required: false
+    default: ""
+  # sccache wiring moved out of this composite (2026-05-03): callers
+  # now invoke `./veric-engine/.github/actions/setup-sccache` directly
+  # in the workflow before this action, mirroring veric-ag PR #11 and
+  # ag-tower's pattern. Single source of truth across repos. To skip
+  # sccache on a job (e.g. test-shards which runs pre-built nextest
+  # binaries — no rustc, no cache wins), simply omit the setup-sccache
+  # call for that job. Pair with `./veric-engine/.github/actions/sccache-stats`
+  # as the LAST `if: always()` step.
+
+runs:
+  using: composite
+  steps:
+    # The ARC runner image (`ghcr.io/actions/actions-runner:latest`) is
+    # minimal and ships without a C toolchain, so cargo build fails with
+    # "linker `cc` not found". Install build-essential + mold once per job
+    # before any cargo step runs. Skip on macOS (xcode-select provides cc)
+    # and skip if cc is already on PATH (custom-image runners).
+    - name: Install C toolchain (Linux ARC runners)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v cc >/dev/null && command -v mold >/dev/null; then
+          exit 0
+        fi
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          build-essential mold pkg-config libssl-dev ca-certificates curl
+
+    - name: Cargo registry auth (veric)
+      if: inputs.registry-auth == 'true'
+      uses: ./veric-engine/.github/actions/cargo-registry-auth
+      with:
+        aws-role-arn: ${{ inputs.aws-role-arn }}
+        secret-name:  ${{ inputs.cargo-secret-name != '' && inputs.cargo-secret-name || 'veric/foundation/kellnr/cargo-read-token-veric-ci' }}
+
+    - name: Install stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # sccache wiring lives in the workflow now (vendored composite at
+    # ./veric-engine/.github/actions/setup-sccache). The composite must
+    # have run BEFORE this action so that RUSTC_WRAPPER=sccache is set
+    # when rust-cache below first invokes cargo. Pair with the sibling
+    # `sccache-stats` composite as the LAST `if: always()` step.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: veric-engine -> target
+        shared-key: ${{ inputs.shared-cache-key }}
+        key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save-cache }}
+        # Cache even on build failure so the next attempt skips crates
+        # that already compiled — the arrow/duckdb mass is the thing we
+        # never want to re-pay on transient failures.
+        cache-on-failure: true
+
+    - name: Install nextest
+      if: inputs.install-nextest == 'true'
+      uses: taiki-e/install-action@nextest

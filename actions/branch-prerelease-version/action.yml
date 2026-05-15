@@ -1,0 +1,109 @@
+name: Branch pre-release version
+description: |
+  Compute a SemVer 2.0.0 pre-release version string from a branch ref and short SHA.
+  Used by branch-publish.yml across the Rust repos so PRs publish to Kellnr as
+  ${base_version}-${branch_slug}.${sha_short} (e.g. 0.5.2-r14-cleanup.a1b2c3d).
+
+inputs:
+  base-version:
+    description: "Base SemVer version (e.g. workspace.version). The pre-release suffix is appended to this. Must already be a valid SemVer."
+    required: true
+  head-ref:
+    description: "Branch ref. Typically github.head_ref (PR) or the branch portion of github.ref. Slashes and other invalid SemVer characters are sanitised."
+    required: true
+  sha:
+    description: "Commit SHA (full or short). Truncated to 7 chars."
+    required: true
+  max-slug-length:
+    description: "Maximum length for the sanitised slug. Default 30."
+    required: false
+    default: "30"
+
+outputs:
+  prerelease:
+    description: "The full pre-release version string (e.g. 0.5.2-r14-cleanup.a1b2c3d)."
+    value: ${{ steps.compute.outputs.prerelease }}
+  slug:
+    description: "Just the sanitised branch slug (the middle component)."
+    value: ${{ steps.compute.outputs.slug }}
+  sha-short:
+    description: "The truncated SHA used in the version."
+    value: ${{ steps.compute.outputs.sha-short }}
+
+runs:
+  using: composite
+  steps:
+    - id: compute
+      shell: bash
+      env:
+        BASE_VERSION: ${{ inputs.base-version }}
+        HEAD_REF: ${{ inputs.head-ref }}
+        SHA: ${{ inputs.sha }}
+        MAX_LEN: ${{ inputs.max-slug-length }}
+      run: |
+        set -euo pipefail
+
+        # --- validate base-version is a plausible SemVer (X.Y.Z, optionally with -prerelease or +build) ---
+        if ! [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-].*)?$ ]]; then
+          echo "::error::base-version is not a SemVer: $BASE_VERSION" >&2
+          exit 1
+        fi
+
+        # If base-version already has a pre-release component, we replace it.
+        # (Workspace versions in the Rust repos are always plain X.Y.Z; this
+        # guard exists so a misconfigured caller doesn't double-prerelease.)
+        BASE_STRIPPED="${BASE_VERSION%%[-+]*}"
+
+        # --- sanitise the branch slug ---
+        # Sanitisation rules (SemVer 2.0.0 §9):
+        #   - Identifiers comprise only [0-9A-Za-z-].
+        #   - Numeric identifiers must not have leading zeroes.
+        #   - Identifiers must not be empty.
+        # Approach:
+        #   1. lowercase
+        #   2. replace any run of disallowed chars with '-'
+        #   3. collapse runs of '-' to single '-'
+        #   4. trim leading/trailing '-'
+        #   5. truncate to MAX_LEN
+        #   6. re-trim trailing '-' (in case the truncation cut mid-run)
+        slug=$(printf '%s' "$HEAD_REF" | tr '[:upper:]' '[:lower:]')
+        slug=$(printf '%s' "$slug" | sed -E 's/[^0-9a-z-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//')
+        if [ ${#slug} -gt "$MAX_LEN" ]; then
+          slug="${slug:0:$MAX_LEN}"
+          slug="${slug%-}"
+        fi
+        if [ -z "$slug" ]; then
+          echo "::error::head-ref '$HEAD_REF' sanitises to empty slug" >&2
+          exit 1
+        fi
+
+        # --- SemVer dot-separated identifiers may not be pure-numeric with leading zero.
+        # Our slug is dash-joined, not dot-joined, so this only matters at the segment
+        # boundary with the SHA. The SHA is hex (always has letters when truncated to 7
+        # chars in practice, but defensively prefix it with 'g' if it's pure-numeric).
+        sha_short="${SHA:0:7}"
+        if [[ "$sha_short" =~ ^[0-9]+$ ]]; then
+          sha_short="g${sha_short}"
+        fi
+
+        prerelease="${BASE_STRIPPED}-${slug}.${sha_short}"
+
+        # --- final SemVer sanity check ---
+        if ! [[ "$prerelease" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+          echo "::error::computed prerelease is not a valid SemVer: $prerelease" >&2
+          exit 1
+        fi
+
+        echo "slug=$slug"             >> "$GITHUB_OUTPUT"
+        echo "sha-short=$sha_short"   >> "$GITHUB_OUTPUT"
+        echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+        # surface to logs so debugging a Kellnr push is easy
+        {
+          echo "Branch pre-release computed:"
+          echo "  base-version = $BASE_VERSION (stripped: $BASE_STRIPPED)"
+          echo "  head-ref     = $HEAD_REF"
+          echo "  slug         = $slug"
+          echo "  sha          = $SHA → $sha_short"
+          echo "  prerelease   = $prerelease"
+        } >&2
