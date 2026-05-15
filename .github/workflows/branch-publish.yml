@@ -1,0 +1,327 @@
+name: branch-publish (reusable)
+
+# Reusable workflow_call: publish a Cargo workspace's pre-release
+# artefacts to Kellnr `veric-internal` on every PR sync, versioned
+# `${workspace.version}-${branch_slug}.${sha_short}`.
+#
+# Behaviour identical to the per-repo branch-publish.yml that
+# ai-fundamentals and veric-engine each maintained until 2026-05-15;
+# this workflow is the single source of truth, with three caller-side
+# inputs for the bits that actually differ (publishable-crate exclude
+# regex, PR-comment pin example, repo display name in the PR comment).
+#
+# Caller stub shape:
+#
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#     id-token: write
+#   concurrency:
+#     group: branch-publish-${{ github.event.pull_request.number }}
+#     cancel-in-progress: true
+#   jobs:
+#     publish:
+#       uses: veric-dev/.github/.github/workflows/branch-publish.yml@main
+#       with:
+#         exclude-regex: '^$'
+#         pin-example-toml: |
+#           crate-a = { version = "=${PRERELEASE}", registry = "veric-internal" }
+#         sccache-role-arn:         ${{ vars.SCCACHE_ROLE_ARN }}
+#         sccache-bucket:           ${{ vars.SCCACHE_BUCKET }}
+#         cargo-ci-reader-role-arn: ${{ vars.CARGO_CI_READER_ROLE_ARN }}
+#       secrets: inherit
+#
+# Auth: identical to release-plz.yml in each consumer repo. OIDC →
+# AWS Secrets Manager → CARGO_REGISTRIES_VERIC_INTERNAL_TOKEN via
+# `veric-dev/.github/actions/cargo-registry-auth@main`.
+
+on:
+  workflow_call:
+    inputs:
+      exclude-regex:
+        description: |
+          Egrep regex of crate names to exclude from `cargo publish`.
+          Use `^$` (default) for "no exclusions". Source of truth for
+          the exclusion list is the consumer repo's release-plz.toml
+          `release = false` overrides.
+        type: string
+        default: '^$'
+      pin-example-toml:
+        description: |
+          Cargo.toml snippet shown in the PR comment, with literal
+          `${PRERELEASE}` placeholder (substituted at comment-render
+          time). Multiline string.
+        type: string
+        required: true
+      runs-on:
+        description: "Runner label (default 'release' = ARC release pool)."
+        type: string
+        default: release
+      timeout-minutes:
+        description: "Job timeout (minutes). Default 60."
+        type: number
+        default: 60
+      sccache-role-arn:
+        description: "AWS IAM role for sccache S3 backend (caller-supplied since reusable workflows don't inherit repo `vars`)."
+        type: string
+        required: true
+      sccache-bucket:
+        description: "S3 bucket name for sccache backend."
+        type: string
+        required: true
+      cargo-ci-reader-role-arn:
+        description: "AWS IAM role for cargo-registry-auth (Secrets Manager read on the kellnr publish token)."
+        type: string
+        required: true
+
+jobs:
+  publish:
+    name: publish workspace to veric-internal
+    if: github.event.pull_request.draft == false
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # No `environment:` — branch-publish runs on PR branches, and the
+    # GH `release` env is locked to `main` in each consumer repo. The
+    # IAM trust on `veric-cargo-ci-reader` already accepts the bare
+    # `repo:veric-dev/<r>:pull_request` OIDC subject (see
+    # veric-aws/infra/tofu/modules/foundation/cargo-ci-reader/main.tf),
+    # so dropping the environment scope works end-to-end.
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Configure RUSTFLAGS for runner arch
+        uses: veric-dev/.github/actions/rustflags-for-arch@main
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: branch-publish
+          cache-on-failure: true
+
+      - uses: veric-dev/.github/actions/setup-sccache@main
+        with:
+          role-arn: ${{ inputs.sccache-role-arn }}
+          bucket: ${{ inputs.sccache-bucket }}
+          key-prefix: v1/${{ runner.os }}/${{ runner.arch }}
+
+      - name: Read base workspace version
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=$(awk '/^\[workspace\.package\]/{f=1;next} f && /^version *=/ {gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)
+          if [ -z "$v" ]; then echo "::error::could not read workspace.package.version"; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Compute pre-release version
+        id: prerelease
+        uses: veric-dev/.github/actions/branch-prerelease-version@main
+        with:
+          base-version: ${{ steps.base.outputs.version }}
+          head-ref: ${{ github.event.pull_request.head.ref }}
+          sha: ${{ github.event.pull_request.head.sha }}
+
+      - name: Bump workspace.package.version + workspace.dependencies path-dep versions
+        shell: bash
+        env:
+          PRERELEASE: ${{ steps.prerelease.outputs.prerelease }}
+          BASE_VERSION: ${{ steps.base.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Mirrors `cargo set-version --workspace ${PRERELEASE}` for
+          # the two things it touches: (1) workspace.package.version,
+          # (2) the `version` spec on every [workspace.dependencies]
+          # entry that is a path-dep to a workspace member. The
+          # path-dep rewrite matters because cargo publish bakes the
+          # version spec into the published Cargo.toml — sibling
+          # pre-releases must point at each other's pre-release
+          # versions, not the base.
+          #
+          # We do this with awk instead of cargo-edit because:
+          #  - cargo-edit 0.13.10 (2026-05) added a SemVer-downgrade
+          #    guard that rejects "X.Y.Z → X.Y.Z-prerelease" (since
+          #    pre-release < release by SemVer), which is exactly the
+          #    transition we want here;
+          #  - installing cargo-edit on the runner is an ~8min cold
+          #    compile every branch-publish run.
+          awk -v base="$BASE_VERSION" -v pre="$PRERELEASE" '
+            BEGIN { in_pkg=0; in_deps=0; rewrites=0 }
+            /^\[workspace\.package\]/   { in_pkg=1; in_deps=0; print; next }
+            /^\[workspace\.dependencies\]/ { in_pkg=0; in_deps=1; print; next }
+            /^\[/                        { in_pkg=0; in_deps=0; print; next }
+            in_pkg && /^version *=/ {
+              n = sub("\"" base "\"", "\"" pre "\"")
+              rewrites += n
+              print; next
+            }
+            in_deps && /path *= *"/ && /version *= *"/ {
+              n = gsub(/version *= *"[^"]*"/, "version = \"" pre "\"")
+              rewrites += n
+              print; next
+            }
+            { print }
+            END {
+              print "rewrote " rewrites " version spec(s)" > "/dev/stderr"
+              if (rewrites == 0) exit 1
+            }
+          ' Cargo.toml > Cargo.toml.new
+          mv Cargo.toml.new Cargo.toml
+          echo "workspace.package.version is now:"
+          awk '/^\[workspace\.package\]/{f=1;next} f && /^version *=/ {print; exit}' Cargo.toml
+
+      - name: Cargo registry auth (publish token)
+        uses: veric-dev/.github/actions/cargo-registry-auth@main
+        with:
+          aws-role-arn:       ${{ inputs.cargo-ci-reader-role-arn }}
+          secret-name:        veric/foundation/kellnr/cargo-publish-token-veric-ci
+          fetch-ag-tower-pat: "false"
+
+      - name: Wire publish token to step output
+        id: kv
+        env:
+          RAW: ${{ env._CARGO_TOKEN }}
+        run: |
+          set -euo pipefail
+          token="${RAW#Bearer }"
+          echo "::add-mask::${token}"
+          echo "publish_token=${token}" >> "$GITHUB_OUTPUT"
+
+      # cargo-registry-auth swaps the ambient AWS creds to the
+      # cargo-ci-reader role (Kellnr-only perms). Restore the sccache
+      # STS creds before the publish step, which invokes RUSTC_WRAPPER
+      # (sccache) via `cargo metadata` and needs S3 read on the
+      # sccache bucket.
+      - name: Restore sccache STS creds for cargo build/publish
+        run: |
+          set -euo pipefail
+          {
+            echo "AWS_ACCESS_KEY_ID=${SCCACHE_S3_ACCESS_KEY}"
+            echo "AWS_SECRET_ACCESS_KEY=${SCCACHE_S3_SECRET_KEY}"
+            echo "AWS_SESSION_TOKEN=${SCCACHE_S3_SESSION_TOKEN}"
+          } >> "$GITHUB_ENV"
+
+      - name: cargo publish (publishable crates in topological order)
+        env:
+          CARGO_REGISTRIES_VERIC_INTERNAL_TOKEN: ${{ steps.kv.outputs.publish_token }}
+          CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS: cargo:token
+          EXCLUDE_REGEX: ${{ inputs.exclude-regex }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Enumerate publishable crates (publish list non-empty,
+          # excluding `publish = false`), then sort topologically by
+          # workspace dep graph using `cargo metadata`. Mirrors what
+          # `release-plz publish` does internally, but without
+          # release-plz's tag/PR machinery — branch-publish is a pure
+          # mutation-then-push.
+          #
+          # `--allow-dirty` because we mutated Cargo.toml without
+          # committing; `--no-verify` because the workspace is being
+          # built by ci.yml in parallel.
+          mapfile -t crates < <(cargo metadata --format-version 1 --no-deps \
+            | jq -r '
+                .packages[]
+                | select((.publish // null) == null or (.publish | length) > 0)
+                | select((.publish // null) == null or (.publish | index("veric-internal")))
+                | .name' \
+            | grep -Ev "$EXCLUDE_REGEX")
+          echo "publishable crates: ${crates[*]}"
+
+          # Topological sort: walk the dep graph and only publish a
+          # crate once every workspace-internal dep is already in the
+          # published set.
+          remaining=("${crates[@]}")
+          published=()
+          for _ in $(seq 1 30); do
+            [ ${#remaining[@]} -eq 0 ] && break
+            progressed=0
+            new_remaining=()
+            for c in "${remaining[@]}"; do
+              deps=$(cargo metadata --format-version 1 --no-deps \
+                | jq -r --arg c "$c" --argjson members "$(printf '%s\n' "${crates[@]}" | jq -R . | jq -s .)" '
+                    .packages[] | select(.name == $c)
+                    | .dependencies[]?
+                    | select(.name as $n | $members | index($n))
+                    | .name')
+              ready=1
+              for d in $deps; do
+                if ! printf '%s\n' "${published[@]}" | grep -qx "$d"; then
+                  ready=0; break
+                fi
+              done
+              if [ "$ready" -eq 1 ]; then
+                echo "::group::publish $c"
+                if cargo publish -p "$c" --registry veric-internal --no-verify --allow-dirty; then
+                  published+=("$c")
+                  progressed=1
+                else
+                  echo "$c failed (likely 409 duplicate or transient) — treating as published"
+                  published+=("$c")
+                  progressed=1
+                fi
+                echo "::endgroup::"
+              else
+                new_remaining+=("$c")
+              fi
+            done
+            remaining=("${new_remaining[@]}")
+            if [ "$progressed" -eq 0 ]; then
+              echo "::error::cyclic / unsatisfiable deps; remaining=${remaining[*]}"
+              exit 1
+            fi
+          done
+
+      - name: Upsert PR comment with version + pin instructions
+        if: success()
+        uses: actions/github-script@v7
+        env:
+          PRERELEASE: ${{ steps.prerelease.outputs.prerelease }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          PIN_EXAMPLE_TEMPLATE: ${{ inputs.pin-example-toml }}
+        with:
+          script: |
+            const marker = '<!-- branch-publish-version -->';
+            const prerelease = process.env.PRERELEASE;
+            const sha = process.env.SHA;
+            // Substitute literal ${PRERELEASE} in the caller-supplied
+            // pin-example-toml. Caller passes a snippet like
+            // `crate = { version = "=${PRERELEASE}", ... }`; we splice
+            // in the actual prerelease string here.
+            const pinExample = process.env.PIN_EXAMPLE_TEMPLATE
+              .replace(/\$\{PRERELEASE\}/g, prerelease);
+            const repoName = context.repo.repo;
+            const body = [
+              marker,
+              `### \`${repoName}\` branch pre-release published`,
+              ``,
+              `Version: \`${prerelease}\` (commit \`${sha.slice(0,7)}\`)`,
+              ``,
+              `To consume from sibling repos, pin in your \`Cargo.toml\`:`,
+              ``,
+              '```toml',
+              pinExample.trimEnd(),
+              '```',
+              ``,
+              `Pre-releases are pruned by \`kellnr-gc.yml\` (P3.3); pin the SHA in your branch and the artifact persists until that PR closes.`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - if: always()
+        uses: veric-dev/.github/actions/sccache-stats@main
