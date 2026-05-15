@@ -1,0 +1,89 @@
+name: branch-prerelease-version (self-test)
+
+# Self-test for the branch-prerelease-version composite action. Runs on
+# every PR that touches the action or this workflow. Each matrix entry
+# exercises one input/expected-output pair; failures bubble up via shell
+# exit codes so the workflow is the assertion.
+
+on:
+  pull_request:
+    paths:
+      - "actions/branch-prerelease-version/**"
+      - ".github/workflows/branch-prerelease-version-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-prerelease-version-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cases:
+    name: case ${{ matrix.case.label }}
+    runs-on: fast
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - { label: "simple-branch", base: "0.5.2", ref: "r14-cleanup",       sha: "a1b2c3d4e5f6",       expected: "0.5.2-r14-cleanup.a1b2c3d" }
+          - { label: "slash-in-ref",  base: "0.5.2", ref: "feat/byte-parity",  sha: "deadbeef1234",      expected: "0.5.2-feat-byte-parity.deadbee" }
+          - { label: "uppercase",     base: "1.0.0", ref: "Garrick0-PR-Fix",   sha: "0123456789abcdef",  expected: "1.0.0-garrick0-pr-fix.g0123456" }
+          - { label: "trailing-dash", base: "1.0.0", ref: "feat-",             sha: "abc1234defgh",      expected: "1.0.0-feat.abc1234" }
+          - { label: "many-symbols",  base: "0.7.3", ref: "fix/[bug]#123!",    sha: "ffffffff0000",      expected: "0.7.3-fix-bug-123.fffffff" }
+          - { label: "underscore",    base: "0.7.3", ref: "samuel_g/wip",      sha: "11223344aabb",      expected: "0.7.3-samuel-g-wip.g1122334" }
+          - { label: "dot-in-ref",    base: "0.7.3", ref: "release/v1.2",      sha: "abcdef0123",        expected: "0.7.3-release-v1-2.abcdef0" }
+          - { label: "pure-numeric-sha", base: "0.7.3", ref: "fix-1",          sha: "1234567",           expected: "0.7.3-fix-1.g1234567" }
+          - { label: "short-base",    base: "0.0.1", ref: "main",              sha: "aaaaaaa",           expected: "0.0.1-main.aaaaaaa" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: act
+        uses: ./actions/branch-prerelease-version
+        with:
+          base-version: ${{ matrix.case.base }}
+          head-ref: ${{ matrix.case.ref }}
+          sha: ${{ matrix.case.sha }}
+
+      - name: assert
+        env:
+          GOT: ${{ steps.act.outputs.prerelease }}
+          WANT: ${{ matrix.case.expected }}
+        run: |
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::case=${{ matrix.case.label }} got '$GOT' want '$WANT'"
+            exit 1
+          fi
+          echo "OK: $GOT"
+
+  failure-cases:
+    name: failure case ${{ matrix.case.label }}
+    runs-on: fast
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - { label: "empty-after-sanitise", base: "0.5.2", ref: "!!!",   sha: "abc1234" }
+          - { label: "invalid-base",         base: "v0.5",  ref: "main",  sha: "abc1234" }
+          - { label: "invalid-base-suffix",  base: "0.5.x", ref: "main",  sha: "abc1234" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: act
+        continue-on-error: true
+        uses: ./actions/branch-prerelease-version
+        with:
+          base-version: ${{ matrix.case.base }}
+          head-ref: ${{ matrix.case.ref }}
+          sha: ${{ matrix.case.sha }}
+
+      - name: assert action failed
+        run: |
+          if [ "${{ steps.act.outcome }}" != "failure" ]; then
+            echo "::error::case=${{ matrix.case.label }} expected action to fail but outcome=${{ steps.act.outcome }} prerelease='${{ steps.act.outputs.prerelease }}'"
+            exit 1
+          fi
+          echo "OK: failed as expected"
